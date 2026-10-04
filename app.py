@@ -1,22 +1,20 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
 from datetime import datetime, timedelta
+from sqlalchemy import text
 
-# Modern, clean page configuration
 st.set_page_config(page_title="My Spends", page_icon="💸", layout="centered")
 
-# --- DATABASE SETUP ---
-conn = sqlite3.connect('expenses.db', check_same_thread=False)
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS spends (date DATE, category TEXT, amount REAL, notes TEXT)''')
-c.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT UNIQUE, value REAL)''')
-conn.commit()
+# --- DATABASE SETUP (PostgreSQL via Supabase) ---
+conn = st.connection("postgresql", type="sql")
 
-# Retrieve user's custom weekly limit
-c.execute("SELECT value FROM settings WHERE key='weekly_limit'")
-limit_result = c.fetchone()
-WEEKLY_LIMIT = limit_result[0] if limit_result else 4000.0
+with conn.session as s:
+    s.execute(text('''CREATE TABLE IF NOT EXISTS spends (id SERIAL PRIMARY KEY, date DATE, category TEXT, amount REAL, notes TEXT)'''))
+    s.execute(text('''CREATE TABLE IF NOT EXISTS settings (key TEXT UNIQUE, value REAL)'''))
+    s.commit()
+
+limit_df = conn.query("SELECT value FROM settings WHERE key='weekly_limit'", ttl=0)
+WEEKLY_LIMIT = limit_df.iloc[0]['value'] if not limit_df.empty else 4000.0
 
 # --- INITIALIZE SESSION STATE ---
 if 'input_amt' not in st.session_state: st.session_state.input_amt = 0.0
@@ -31,18 +29,21 @@ def apply_quick_log(amt, cat, note):
 
 def save_spend():
     if st.session_state.input_amt > 0:
-        c.execute("INSERT INTO spends (date, category, amount, notes) VALUES (?, ?, ?, ?)", 
-                  (st.session_state.input_date.strftime('%Y-%m-%d'), 
-                   st.session_state.input_cat, 
-                   st.session_state.input_amt, 
-                   st.session_state.input_note))
-        conn.commit()
+        with conn.session as s:
+            s.execute(
+                text("INSERT INTO spends (date, category, amount, notes) VALUES (:date, :category, :amount, :notes)"),
+                {"date": st.session_state.input_date.strftime('%Y-%m-%d'), 
+                 "category": st.session_state.input_cat, 
+                 "amount": st.session_state.input_amt, 
+                 "notes": st.session_state.input_note}
+            )
+            s.commit()
         st.session_state.input_amt = 0.0
         st.session_state.input_note = ""
         st.session_state.input_date = datetime.today()
 
 # --- LOAD DATA ---
-df = pd.read_sql_query("SELECT rowid, * FROM spends", conn)
+df = conn.query("SELECT * FROM spends", ttl=0)
 df['date'] = pd.to_datetime(df['date'], errors='coerce')
 today = pd.to_datetime("today").normalize()
 
@@ -98,16 +99,12 @@ with tab1:
 
 with tab2:
     if not df.empty:
-        # --- NEW: HIGHEST SPENDS & TOTALS ---
         st.subheader("🏆 Key Highlights")
         hc1, hc2 = st.columns(2)
         hc3, hc4 = st.columns(2)
         
-        # 1. Total All Time
-        total_all_time = df['amount'].sum()
-        hc1.metric("Total All-Time Spend", f"₹{total_all_time:,.0f}")
+        hc1.metric("Total All-Time Spend", f"₹{df['amount'].sum():,.0f}")
         
-        # 2. Yesterday's Highest
         yesterday_str = (today - timedelta(days=1)).strftime('%Y-%m-%d')
         y_df = df[df['date'].dt.strftime('%Y-%m-%d') == yesterday_str]
         if not y_df.empty:
@@ -116,7 +113,6 @@ with tab2:
         else:
             hc2.metric("Yesterday's Highest", "₹0", "No spends")
             
-        # 3. This Week's Highest
         w_df = df[df['date'] >= start_of_week]
         if not w_df.empty:
             w_max = w_df.loc[w_df['amount'].idxmax()]
@@ -124,7 +120,6 @@ with tab2:
         else:
             hc3.metric("This Week's Highest", "₹0", "No spends")
             
-        # 4. This Month's Highest
         m_df = df[df['date'] >= current_month_start]
         if not m_df.empty:
             m_max = m_df.loc[m_df['amount'].idxmax()]
@@ -155,7 +150,7 @@ with tab2:
         st.bar_chart(cat_totals)
         
         st.subheader("Recent Spends")
-        display_df = df.sort_values(by='date', ascending=False).drop(columns=['rowid']).head(15)
+        display_df = df.sort_values(by='date', ascending=False).drop(columns=['id']).head(15)
         display_df['date'] = display_df['date'].dt.strftime('%d %b')
         st.dataframe(display_df, use_container_width=True, hide_index=True)
     else:
@@ -165,8 +160,9 @@ with tab3:
     st.subheader("App Settings")
     new_limit = st.number_input("Set Custom Weekly Limit (₹)", min_value=100.0, value=float(WEEKLY_LIMIT), step=500.0)
     if st.button("Update Limit", use_container_width=True):
-        c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('weekly_limit', ?)", (new_limit,))
-        conn.commit()
+        with conn.session as s:
+            s.execute(text("INSERT INTO settings (key, value) VALUES ('weekly_limit', :val) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"), {"val": new_limit})
+            s.commit()
         st.success("Weekly limit updated!")
         st.rerun()
         
@@ -174,17 +170,18 @@ with tab3:
     
     st.subheader("Delete a Record")
     if not df.empty:
-        recent_records = pd.read_sql_query("SELECT rowid, date, category, amount, notes FROM spends ORDER BY date DESC, rowid DESC LIMIT 20", conn)
+        recent_records = conn.query("SELECT id, date, category, amount, notes FROM spends ORDER BY date DESC, id DESC LIMIT 20", ttl=0)
         record_dict = {}
         for _, row in recent_records.iterrows():
             label = f"{row['date']} | {row['category']} | ₹{row['amount']} ({row['notes']})"
-            record_dict[label] = row['rowid']
+            record_dict[label] = row['id']
             
         selected_label = st.selectbox("Select a recent spend to remove:", list(record_dict.keys()))
         
         if st.button("Delete Selected Spend", use_container_width=True):
-            c.execute("DELETE FROM spends WHERE rowid=?", (record_dict[selected_label],))
-            conn.commit()
+            with conn.session as s:
+                s.execute(text("DELETE FROM spends WHERE id = :id"), {"id": record_dict[selected_label]})
+                s.commit()
             st.success("Record deleted successfully!")
             st.rerun()
     else:
